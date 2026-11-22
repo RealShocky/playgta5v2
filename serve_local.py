@@ -1,5 +1,5 @@
 """Local mirror server: isolation headers, byte ranges, and engine batch I/O."""
-import argparse, gzip, io, json, mimetypes, re, webbrowser
+import argparse, base64, gzip, hashlib, hmac, io, json, math, mimetypes, re, socket, string, struct, threading, time, uuid, webbrowser
 from http.server import SimpleHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from urllib.parse import urlsplit, unquote, parse_qs
@@ -47,6 +47,253 @@ if (!window.PlayGTA5Enhanced) {
 }
 ''', 1)
     return code.replace('<body>', '<body>\n' + link, 1)
+
+# --- WebSocket / multiplayer relay (protocol v1, mirrors LauncherApp/rust/src/relay.rs) ---
+_WS_GUID = b'258EAFA5-E914-47DA-95CA-C5AB0DC85B11'
+
+def _ws_accept(key):
+    return base64.b64encode(hashlib.sha1(key.encode('latin1') + _WS_GUID).digest()).decode('ascii')
+
+def _ws_send_frame(sock, payload, opcode=0x1):
+    if isinstance(payload, str):
+        payload = payload.encode('utf-8')
+    length = len(payload)
+    if length < 126:
+        header = bytes([0x80 | opcode, length])
+    elif length < 65536:
+        header = bytes([0x80 | opcode, 126]) + struct.pack('>H', length)
+    else:
+        header = bytes([0x80 | opcode, 127]) + struct.pack('>Q', length)
+    sock.sendall(header + payload)
+
+def _ws_recv_exact(sock, n):
+    data = b''
+    while len(data) < n:
+        chunk = sock.recv(n - len(data))
+        if not chunk:
+            raise ConnectionError('closed')
+        data += chunk
+    return data
+
+def _ws_recv_frame(sock):
+    head = _ws_recv_exact(sock, 2)
+    opcode = head[0] & 0x0F
+    masked = head[1] & 0x80
+    length = head[1] & 0x7F
+    if length == 126:
+        length = struct.unpack('>H', _ws_recv_exact(sock, 2))[0]
+    elif length == 127:
+        length = struct.unpack('>Q', _ws_recv_exact(sock, 8))[0]
+    mask = _ws_recv_exact(sock, 4) if masked else b'\x00' * 4
+    payload = bytearray(_ws_recv_exact(sock, length)) if length else b''
+    if masked:
+        for i in range(len(payload)):
+            payload[i] ^= mask[i % 4]
+    return opcode, bytes(payload)
+
+def _ws_send_close(sock, code, reason):
+    try:
+        _ws_send_frame(sock, struct.pack('>H', code) + reason.encode('utf-8'), 0x8)
+    except OSError:
+        pass
+
+def _is_identifier(v, max_len, dots):
+    if not isinstance(v, str) or not v or len(v) > max_len:
+        return False
+    allowed = set(string.ascii_letters + string.digits + ('_.-' if dots else '_-'))
+    return all(c in allowed for c in v)
+
+PROTOCOL = 2
+DEFAULT_CAPACITY = 1024
+POSE_HZ = 20
+
+
+def _snapshot(v):
+    if v.get('type') != 'pose':
+        raise ValueError('Unsupported message')
+    seq = v.get('seq')
+    if not (isinstance(seq, int) and not isinstance(seq, bool) and 0 <= seq <= 2147483647):
+        raise ValueError('Invalid sequence')
+    model = v.get('model', 0)
+    if not (isinstance(model, int) and not isinstance(model, bool) and 0 <= model <= 0xFFFFFFFF):
+        raise ValueError('Invalid model')
+    mode = v.get('mode', 'foot')
+    if mode not in ('foot', 'vehicle'):
+        raise ValueError('Invalid mode')
+    def ok(arr, limit):
+        return (isinstance(arr, list) and len(arr) == 3 and
+                all(isinstance(x, (int, float)) and not isinstance(x, bool) and math.isfinite(x) and abs(x) <= limit for x in arr))
+    position, rotation = v.get('position'), v.get('rotation')
+    if not ok(position, 20000.0):
+        raise ValueError('Invalid position')
+    if not ok(rotation, 360.0):
+        raise ValueError('Invalid rotation')
+    return {'type': 'pose', 'seq': seq, 'model': model, 'mode': mode, 'position': position, 'rotation': rotation}
+
+
+class Relay:
+    """One big open room. The engine's mailbox only exposes player position and a
+    single replica/vehicle command channel, so the relay carries every peer's
+    position (and foot/vehicle mode); each client renders the closest peer as a
+    replica. Combat (bullets/health) is not exposed by the engine.
+
+    Access code is optional: if ``code`` is non-empty the client must present the
+    same key; if empty, the room is open to everyone. The 2-player cap is gone.
+    """
+
+    def __init__(self, code, capacity=DEFAULT_CAPACITY):
+        self.code = code
+        self.capacity = max(1, int(capacity))
+        self.lock = threading.Lock()
+        self.rooms = {}
+
+    def _close_with(self, sock, code, reason):
+        _ws_send_close(sock, code, reason)
+
+    def _key_ok(self, hello_key):
+        if not self.code:
+            return True
+        return isinstance(hello_key, str) and hmac.compare_digest(hello_key, self.code)
+
+    def serve_session(self, sock, hello):
+        hello = hello if isinstance(hello, dict) else {}
+        error = None
+        if hello.get('type') not in ('check', 'join') or hello.get('protocol') != PROTOCOL:
+            error = 'Protocol mismatch'
+        elif not self._key_ok(hello.get('key')):
+            error = 'Join key rejected'
+        elif not _is_identifier(hello.get('room'), 32, False):
+            error = 'Invalid room'
+        elif not _is_identifier(hello.get('build'), 96, True) or hello.get('map') not in ('gta5', 'env_test'):
+            error = 'Invalid build/map'
+        if error:
+            self._close_with(sock, 1008, error)
+            return
+        checked = hello['type'] == 'check'
+        room_name, build, mapp = hello['room'], hello['build'], hello['map']
+        with self.lock:
+            room = self.rooms.get(room_name)
+            if room and (room['build'] != build or room['map'] != mapp):
+                error = 'Room build/map mismatch'
+            elif room and len(room['peers']) >= self.capacity:
+                error = 'Room full'
+            else:
+                players = 0 if room is None else len(room['peers'])
+        if error:
+            self._close_with(sock, 1008, error)
+            return
+        if checked:
+            try:
+                _ws_send_frame(sock, json.dumps({'type': 'checked', 'players': players, 'capacity': self.capacity, 'open': not self.code}))
+            except OSError:
+                return
+            self._close_with(sock, 1000, 'Check complete')
+            return
+        peer_id = uuid.uuid4().hex[:16]
+        with self.lock:
+            room = self.rooms.setdefault(room_name, {'build': build, 'map': mapp, 'peers': {}})
+            existing = [(pid, room['peers'][pid]['pose']) for pid in room['peers']]
+            room['peers'][peer_id] = {'sock': sock, 'pose': None, 'alive': True}
+        try:
+            # Send the newcomer every other peer's latest pose so it can place them
+            # immediately instead of waiting for the next tick.
+            for pid, pose in existing:
+                if pose is not None:
+                    _ws_send_frame(sock, json.dumps(pose))
+            _ws_send_frame(sock, json.dumps({'type': 'welcome', 'protocol': PROTOCOL, 'id': peer_id, 'players': len(existing), 'hz': POSE_HZ}))
+        except OSError:
+            self._remove(room_name, peer_id)
+            return
+        sock.settimeout(2)
+        last_seq, tokens, last = None, 30.0, time.monotonic()
+        ping_sent_at = None
+        try:
+            while True:
+                try:
+                    opcode, payload = _ws_recv_frame(sock)
+                except socket.timeout:
+                    if ping_sent_at is None:
+                        _ws_send_frame(sock, b'', 0x9)
+                        ping_sent_at = time.monotonic()
+                    elif time.monotonic() - ping_sent_at > 2:
+                        self._close_with(sock, 1008, 'Heartbeat timeout')
+                        return
+                    continue
+                if opcode == 0x9:
+                    _ws_send_frame(sock, payload, 0xA)
+                elif opcode == 0xA:
+                    ping_sent_at = None
+                elif opcode == 0x8:
+                    break
+                elif opcode == 0x1:
+                    now = time.monotonic()
+                    tokens = min(30.0, tokens + (now - last) * 25.0)
+                    last = now
+                    if tokens < 1.0:
+                        self._close_with(sock, 1008, 'Message rate exceeded')
+                        return
+                    tokens -= 1.0
+                    try:
+                        snap = _snapshot(json.loads(payload.decode('utf-8')))
+                    except (ValueError, TypeError, KeyError, json.JSONDecodeError) as exc:
+                        self._close_with(sock, 1008, str(exc))
+                        return
+                    if last_seq is not None and snap['seq'] <= last_seq:
+                        continue
+                    last_seq = snap['seq']
+                    snap['id'] = peer_id
+                    snap['seq'] = last_seq
+                    data = json.dumps(snap).encode('utf-8')
+                    with self.lock:
+                        self.rooms.get(room_name, {}).get('peers', {}).setdefault(peer_id, {}).update(pose=snap, alive=True)
+                        others = [p['sock'] for pid, p in self.rooms.get(room_name, {}).get('peers', {}).items() if pid != peer_id and p.get('alive')]
+                    for ps in others:
+                        try:
+                            _ws_send_frame(ps, data)
+                        except OSError:
+                            pass
+                else:
+                    self._close_with(sock, 1008, 'Unsupported message')
+                    return
+        except (ConnectionError, OSError):
+            pass
+        finally:
+            self._left(room_name, peer_id)
+
+    def _remove(self, room_name, peer_id):
+        with self.lock:
+            room = self.rooms.get(room_name)
+            if not room:
+                return
+            room['peers'].pop(peer_id, None)
+            if not room['peers']:
+                self.rooms.pop(room_name, None)
+
+    def _left(self, room_name, peer_id):
+        self._remove(room_name, peer_id)
+        msg = json.dumps({'type': 'left', 'id': peer_id}).encode('utf-8')
+        with self.lock:
+            others = [p['sock'] for p in self.rooms.get(room_name, {}).get('peers', {}).values() if p.get('alive')]
+        for ps in others:
+            try:
+                _ws_send_frame(ps, msg)
+            except OSError:
+                pass
+
+def _load_access_code(base_dir):
+    path = Path(base_dir) / 'multiplayer-access-code.txt'
+    if path.is_file():
+        code = path.read_text(encoding='utf-8').strip()
+        if code:
+            return code
+    code = 'gtav-' + uuid.uuid4().hex[:8]
+    try:
+        path.write_text(code + '\n', encoding='utf-8')
+    except OSError:
+        pass
+    return code
+
+RELAY = None
 
 class Handler(SimpleHTTPRequestHandler):
     def setup(self):
@@ -127,6 +374,42 @@ class Handler(SimpleHTTPRequestHandler):
             outputfile.write(chunk)
             remaining -= len(chunk)
 
+    def do_GET(self):
+        if urlsplit(self.path).path == '/relay' and self.headers.get('Upgrade', '').lower() == 'websocket' and RELAY is not None:
+            self.handle_relay()
+            return
+        super().do_GET()
+
+    def handle_relay(self):
+        key = self.headers.get('Sec-WebSocket-Key', '')
+        if not key:
+            self.send_error(400, 'Missing Sec-WebSocket-Key')
+            return
+        self.close_connection = True
+        response = ('HTTP/1.1 101 Switching Protocols\r\nUpgrade: websocket\r\n'
+                    'Connection: Upgrade\r\nSec-WebSocket-Accept: %s\r\n\r\n' % _ws_accept(key))
+        self.wfile.write(response.encode('ascii'))
+        self.wfile.flush()
+        sock = self.connection
+        sock.settimeout(5)
+        try:
+            hello = None
+            try:
+                opcode, payload = _ws_recv_frame(sock)
+                if opcode == 0x1:
+                    hello = json.loads(payload.decode('utf-8'))
+            except (socket.timeout, ConnectionError, OSError, json.JSONDecodeError):
+                hello = None
+            sock.settimeout(None)
+            RELAY.serve_session(sock, hello)
+        except OSError:
+            pass
+        finally:
+            try:
+                sock.close()
+            except OSError:
+                pass
+
     def do_POST(self):
         url = urlsplit(self.path)
         if url.path != '/data/batch':
@@ -181,17 +464,29 @@ if __name__ == '__main__':
     args.add_argument('--port', type=int, default=8000)
     args.add_argument('--root', type=Path, help='existing game directory containing index.html, b/, and data/')
     args.add_argument('--open', action='store_true', help='open browser compatibility and launch page')
+    args.add_argument('--mp-open', action='store_true', help='one big open room: no access code required (default)')
+    args.add_argument('--mp-code', help='require this access code to join (one code for the whole room)')
+    args.add_argument('--mp-capacity', type=int, default=DEFAULT_CAPACITY, help='max players in a room (default 1024)')
     options = args.parse_args()
     if options.root:
         ROOT = options.root.resolve()
     if not (ROOT / 'index.html').is_file():
         args.error('Game files are missing. Run Download-Game.cmd (Windows) or Download-Game.command (Mac) first.')
+    # Open room by default; --mp-code <code> locks the whole room behind one code.
+    access_code = options.mp_code or ''
+    RELAY = Relay(access_code, capacity=options.mp_capacity)
     try:
         server = ThreadingHTTPServer(('127.0.0.1', options.port), Handler)
     except OSError as error:
         args.error(f'Cannot start on port {options.port}: {error}. Close the previous game server with Ctrl+C, or choose --port 8001.')
     address = 'http://localhost:%d/' % server.server_port
     print('Local mirror: %s (Ctrl+C to stop)' % address, flush=True)
+    if access_code:
+        print('Multiplayer relay: ws://%s:%d/relay  access code: %s  (same room + code on each PC, up to %d players)' % (
+            'localhost', server.server_port, access_code, options.mp_capacity), flush=True)
+    else:
+        print('Multiplayer relay: ws://%s:%d/relay  OPEN room, no access code (up to %d players)' % (
+            'localhost', server.server_port, options.mp_capacity), flush=True)
     if options.open:
         webbrowser.open(address + '__support/')
     try:

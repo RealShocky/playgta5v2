@@ -38,8 +38,13 @@ async function check() {
     if (!report.offscreenCanvas) throw new Error('OffscreenCanvas is unavailable; this engine cannot render in the current browser.');
     const response = await fetch('/', { cache: 'no-store' });
     report.pageHTTP = response.status;
-    const html = await response.text();
-    const build = html.match(/\/b\/([a-zA-Z0-9_-]+)\//);
+    let html = await response.text();
+    let build = html.match(/\/b\/([a-zA-Z0-9_-]+)\//);
+    if (!build) {
+      const gamePage = await fetch('/game.html', { cache: 'no-store' });
+      if (gamePage.status === 200) html = await gamePage.text();
+      build = html.match(/\/b\/([a-zA-Z0-9_-]+)\//);
+    }
     if (build) {
       const wasm = await fetch(`/b/${build[1]}/game.wasm`, { headers: { Range: 'bytes=0-3' } });
       report.wasmHTTP = wasm.status;
