@@ -108,6 +108,16 @@ DEFAULT_CAPACITY = 1024
 POSE_HZ = 20
 
 
+def _vec_ok(arr, limit):
+    return (isinstance(arr, list) and len(arr) == 3 and
+            all(isinstance(x, (int, float)) and not isinstance(x, bool) and math.isfinite(x) and abs(x) <= limit for x in arr))
+
+
+def _is_name(v):
+    return (isinstance(v, str) and 1 <= len(v) <= 24 and
+            all(c.isalnum() or c in ' _-.(' for c in v)) and v.strip() != ''
+
+
 def _snapshot(v):
     if v.get('type') != 'pose':
         raise ValueError('Unsupported message')
@@ -120,15 +130,55 @@ def _snapshot(v):
     mode = v.get('mode', 'foot')
     if mode not in ('foot', 'vehicle'):
         raise ValueError('Invalid mode')
-    def ok(arr, limit):
-        return (isinstance(arr, list) and len(arr) == 3 and
-                all(isinstance(x, (int, float)) and not isinstance(x, bool) and math.isfinite(x) and abs(x) <= limit for x in arr))
     position, rotation = v.get('position'), v.get('rotation')
-    if not ok(position, 20000.0):
+    if not _vec_ok(position, 20000.0):
         raise ValueError('Invalid position')
-    if not ok(rotation, 360.0):
+    if not _vec_ok(rotation, 360.0):
         raise ValueError('Invalid rotation')
-    return {'type': 'pose', 'seq': seq, 'model': model, 'mode': mode, 'position': position, 'rotation': rotation}
+    hp = v.get('hp', 100)
+    if not (isinstance(hp, (int, float)) and not isinstance(hp, bool) and 0 <= hp <= 100):
+        raise ValueError('Invalid hp')
+    name = v.get('name')
+    if name is not None and not _is_name(name):
+        raise ValueError('Invalid name')
+    snap = {'type': 'pose', 'seq': seq, 'model': model, 'mode': mode, 'position': position,
+            'rotation': rotation, 'hp': hp, 'down': v.get('down') is True}
+    if name is not None:
+        snap['name'] = name.strip()
+    return snap
+
+
+def _forwarded(v):
+    """Validate and normalise non-pose room messages: shoot, hit, down, respawn, chat."""
+    if not isinstance(v, dict):
+        raise ValueError('Unsupported message')
+    t = v.get('type')
+    if t == 'shoot':
+        if not _vec_ok(v.get('position'), 20000.0):
+            raise ValueError('Invalid position')
+        seq = v.get('seq')
+        if not (isinstance(seq, int) and not isinstance(seq, bool) and 0 <= seq <= 2147483647):
+            raise ValueError('Invalid sequence')
+        return {'type': 'shoot', 'seq': seq, 'position': v['position']}
+    if t == 'hit':
+        target = v.get('target')
+        if not isinstance(target, str) or not (1 <= len(target) <= 24):
+            raise ValueError('Invalid target')
+        dmg = v.get('dmg')
+        if not (isinstance(dmg, (int, float)) and not isinstance(dmg, bool) and 0 < dmg <= 100):
+            raise ValueError('Invalid damage')
+        seq = v.get('seq')
+        if not (isinstance(seq, int) and not isinstance(seq, bool) and 0 <= seq <= 2147483647):
+            raise ValueError('Invalid sequence')
+        return {'type': 'hit', 'seq': seq, 'target': target, 'dmg': dmg}
+    if t == 'chat':
+        text = v.get('text')
+        if not isinstance(text, str) or not text.strip() or len(text) > 200:
+            raise ValueError('Invalid chat')
+        return {'type': 'chat', 'text': text[:200]}
+    if t in ('down', 'respawn'):
+        return {'type': t}
+    raise ValueError('Unsupported message')
 
 
 class Relay:
@@ -154,6 +204,16 @@ class Relay:
         if not self.code:
             return True
         return isinstance(hello_key, str) and hmac.compare_digest(hello_key, self.code)
+
+    def _broadcast(self, room_name, sender_id, data):
+        """Send ``data`` bytes to every other live peer in the room."""
+        with self.lock:
+            others = [p['sock'] for pid, p in self.rooms.get(room_name, {}).get('peers', {}).items() if pid != sender_id and p.get('alive')]
+        for ps in others:
+            try:
+                _ws_send_frame(ps, data)
+            except OSError:
+                pass
 
     def serve_session(self, sock, hello):
         hello = hello if isinstance(hello, dict) else {}
@@ -234,24 +294,37 @@ class Relay:
                         return
                     tokens -= 1.0
                     try:
-                        snap = _snapshot(json.loads(payload.decode('utf-8')))
-                    except (ValueError, TypeError, KeyError, json.JSONDecodeError) as exc:
-                        self._close_with(sock, 1008, str(exc))
+                        parsed = json.loads(payload.decode('utf-8'))
+                    except json.JSONDecodeError:
+                        parsed = None
+                    if not isinstance(parsed, dict):
+                        self._close_with(sock, 1008, 'Unsupported message')
                         return
-                    if last_seq is not None and snap['seq'] <= last_seq:
-                        continue
-                    last_seq = snap['seq']
-                    snap['id'] = peer_id
-                    snap['seq'] = last_seq
-                    data = json.dumps(snap).encode('utf-8')
-                    with self.lock:
-                        self.rooms.get(room_name, {}).get('peers', {}).setdefault(peer_id, {}).update(pose=snap, alive=True)
-                        others = [p['sock'] for pid, p in self.rooms.get(room_name, {}).get('peers', {}).items() if pid != peer_id and p.get('alive')]
-                    for ps in others:
+                    mtype = parsed.get('type')
+                    if mtype == 'pose':
                         try:
-                            _ws_send_frame(ps, data)
-                        except OSError:
-                            pass
+                            snap = _snapshot(parsed)
+                        except (ValueError, TypeError, KeyError) as exc:
+                            self._close_with(sock, 1008, str(exc))
+                            return
+                        if last_seq is not None and snap['seq'] <= last_seq:
+                            continue
+                        last_seq = snap['seq']
+                        snap['id'] = peer_id
+                        snap['seq'] = last_seq
+                        data = json.dumps(snap).encode('utf-8')
+                        with self.lock:
+                            self.rooms.get(room_name, {}).get('peers', {}).setdefault(peer_id, {}).update(pose=snap, alive=True)
+                        self._broadcast(room_name, peer_id, data)
+                    else:
+                        # shoot / hit / down / respawn / chat: validate and forward.
+                        try:
+                            fwd = _forwarded(parsed)
+                        except (ValueError, TypeError, KeyError) as exc:
+                            self._close_with(sock, 1008, str(exc))
+                            return
+                        fwd['id'] = peer_id
+                        self._broadcast(room_name, peer_id, json.dumps(fwd).encode('utf-8'))
                 else:
                     self._close_with(sock, 1008, 'Unsupported message')
                     return

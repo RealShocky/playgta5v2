@@ -17,6 +17,24 @@ A genuine shared-world implementation needs:
 
 An invite link, chat room or position overlay would not meet that requirement. No multiplayer is claimed or supplied. Track the feature in [#17](https://github.com/alihammoud21/playgta5/issues/17).
 
+### Browser multiplayer layer (experimental, added to this fork)
+
+`serve_local.py` now serves a WebSocket relay at `/relay` (protocol v2) that runs
+a single big open room (no 2-player cap, optional access code via `--mp-code`,
+1024-player default capacity). The in-browser client (`multiplayer.js`) streams
+each player's position, foot/vehicle mode, health and name, and renders the
+nearest peer as an engine replica. On top of that it provides **positional
+networked combat** (fire in range with the crosshair centered; distance damage
+falloff; hit markers/sounds; down & auto-respawn) and a **chat** channel with a
+player roster.
+
+This is a browser-side layer, not engine multiplayer: the engine still exposes
+only player position and one replica/vehicle command channel. So it is
+positional — there are no in-engine bullets, health, or per-entity ownership,
+and the engine can show one remote entity at a time. Vehicle *positions* sync;
+vehicle *combat* and missions do not. Treat this as a prototype on the road to
+item 1–4 above, not a replacement for a buildable engine integration.
+
 ## Minimap and vehicles
 
 - [#13](https://github.com/alihammoud21/playgta5/issues/13): files verified, minimap roads missing on two device/browser paths; other audio works but several vehicle engines are silent. A generic autoplay or incomplete-download explanation does not fit all this evidence.

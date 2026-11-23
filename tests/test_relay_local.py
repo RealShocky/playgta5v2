@@ -95,12 +95,14 @@ def main():
 
     # Four joins all succeed (capacity=4): each gets welcome with prior peer count
     sockets = []
+    peer_ids = []
     welcome_players = []
     for i in range(4):
         p = ws_connect()
         ws_send(p, {'type': 'join', 'protocol': 2, 'key': '', 'room': 'open', 'build': BUILD, 'map': 'gta5'})
         w = recv_json(p)
         sockets.append(p)
+        peer_ids.append(w.get('id'))
         welcome_players.append((w.get('type'), w.get('players')))
     check('open room admits 4 peers (no 2-player cap)', welcome_players == [('welcome', 0), ('welcome', 1), ('welcome', 2), ('welcome', 3)])
 
@@ -122,6 +124,52 @@ def main():
         except AssertionError:
             pass
     check('pose fanned out to all 3 other peers (vehicle mode)', got == 3)
+
+    # Chat forwarding: sockets[0] sends chat; 1,2,3 receive it tagged with id0.
+    ws_send(sockets[0], {'type': 'chat', 'text': 'hello room'})
+    chat_ok = 0
+    for i in (1, 2, 3):
+        try:
+            m = recv_json(sockets[i], timeout=3)
+            if m.get('type') == 'chat' and m.get('text') == 'hello room' and m.get('id') == peer_ids[0]:
+                chat_ok += 1
+        except AssertionError:
+            pass
+    check('chat forwarded to all 3 other peers', chat_ok == 3)
+
+    # Shoot forwarding: sockets[0] sends shoot; 1,2,3 receive it tagged with id0.
+    ws_send(sockets[0], {'type': 'shoot', 'seq': 7, 'position': [5.0, 6.0, 7.0]})
+    shoot_ok = 0
+    for i in (1, 2, 3):
+        try:
+            m = recv_json(sockets[i], timeout=3)
+            if m.get('type') == 'shoot' and m.get('seq') == 7 and m.get('position') == [5.0, 6.0, 7.0] and m.get('id') == peer_ids[0]:
+                shoot_ok += 1
+        except AssertionError:
+            pass
+    check('shoot forwarded to all 3 other peers', shoot_ok == 3)
+
+    # Hit targeting: sockets[0] sends hit aimed at peer_ids[1]; sockets[1] receives it, sockets[2] does not.
+    ws_send(sockets[0], {'type': 'hit', 'seq': 3, 'target': peer_ids[1], 'dmg': 12.5})
+    hit_to_target = None
+    for _ in range(3):
+        try:
+            m = recv_json(sockets[1], timeout=3)
+            if m.get('type') == 'hit' and m.get('target') == peer_ids[1] and m.get('dmg') == 12.5:
+                hit_to_target = m
+                break
+        except AssertionError:
+            pass
+    check('hit delivered to the targeted peer', hit_to_target is not None and hit_to_target.get('id') == peer_ids[0])
+
+    # Invalid chat (empty) -> close 1008
+    bad = ws_connect()
+    ws_send(bad, {'type': 'join', 'protocol': 2, 'key': '', 'room': 'open2', 'build': BUILD, 'map': 'gta5'})
+    recv_json(bad)  # welcome
+    ws_send(bad, {'type': 'chat', 'text': '   '})
+    op, payload = ws_recv(bad, timeout=5)
+    check('invalid chat closes with 1008', op == 0x8 and struct.unpack('>H', payload[:2])[0] == 1008)
+    bad.close()
 
     for s in sockets:
         try:
