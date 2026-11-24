@@ -171,6 +171,21 @@ def main():
     check('invalid chat closes with 1008', op == 0x8 and struct.unpack('>H', payload[:2])[0] == 1008)
     bad.close()
 
+    # Non-websocket GET /relay (proxy stripped the Upgrade header, or a plain GET)
+    # -> a clear 426 instead of a confusing 404 file-missing. This is the signal that
+    # tells a user "the request reached the relay port but the proxy did not forward
+    # the WebSocket upgrade."
+    plain = socket.create_connection(('127.0.0.1', PORT), timeout=5)
+    plain.sendall(b'GET /relay HTTP/1.1\r\nHost: 127.0.0.1\r\nConnection: close\r\n\r\n')
+    resp = b''
+    while b'\r\n\r\n' not in resp:
+        chunk = plain.recv(4096)
+        if not chunk:
+            break
+        resp += chunk
+    plain.close()
+    check('non-websocket /relay -> 426 (detectable, not 404)', b'426' in resp.split(b'\r\n')[0])
+
     for s in sockets:
         try:
             s.close()

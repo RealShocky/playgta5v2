@@ -215,6 +215,24 @@ class Relay:
             except OSError:
                 pass
 
+    def status(self):
+        """Live room overview for /__mp/ and diagnostics."""
+        with self.lock:
+            out = {'open': not self.code, 'capacity': self.capacity, 'rooms': {}}
+            for name, room in self.rooms.items():
+                peers = []
+                for pid, p in room['peers'].items():
+                    pose = p.get('pose') or {}
+                    peers.append({'id': pid, 'name': pose.get('name') or None, 'hp': pose.get('hp'), 'mode': pose.get('mode'), 'pos': pose.get('position'), 'alive': bool(p.get('alive'))})
+                out['rooms'][name] = {'build': room.get('build'), 'map': room.get('map'), 'players': len(peers), 'peers': peers}
+            return out
+
+    def log(self, msg):
+        try:
+            print('[relay] ' + str(msg), flush=True)
+        except Exception:
+            pass
+
     def serve_session(self, sock, hello):
         hello = hello if isinstance(hello, dict) else {}
         error = None
@@ -253,7 +271,8 @@ class Relay:
         with self.lock:
             room = self.rooms.setdefault(room_name, {'build': build, 'map': mapp, 'peers': {}})
             existing = [(pid, room['peers'][pid]['pose']) for pid in room['peers']]
-            room['peers'][peer_id] = {'sock': sock, 'pose': None, 'alive': True}
+            room['peers'][peer_id] = {'sock': sock, 'pose': None, 'alive': True, 'poses': 0, 'last_pose_at': 0}
+        self.log('join %s in room "%s" (%d peers, build=%s map=%s)' % (peer_id, room_name, len(existing), build, mapp))
         try:
             # Send the newcomer every other peer's latest pose so it can place them
             # immediately instead of waiting for the next tick.
@@ -314,7 +333,12 @@ class Relay:
                         snap['seq'] = last_seq
                         data = json.dumps(snap).encode('utf-8')
                         with self.lock:
-                            self.rooms.get(room_name, {}).get('peers', {}).setdefault(peer_id, {}).update(pose=snap, alive=True)
+                            peer = self.rooms.get(room_name, {}).get('peers', {}).setdefault(peer_id, {})
+                            peer.update(pose=snap, alive=True)
+                            peer['poses'] = peer.get('poses', 0) + 1
+                            peer['last_pose_at'] = time.monotonic()
+                            if peer['poses'] in (1, 10, 100):
+                                self.log('pose %s (room "%s") # %d pos=%s' % (peer_id, room_name, peer['poses'], snap['position']))
                         self._broadcast(room_name, peer_id, data)
                     else:
                         # shoot / hit / down / respawn / chat: validate and forward.
@@ -343,7 +367,11 @@ class Relay:
                 self.rooms.pop(room_name, None)
 
     def _left(self, room_name, peer_id):
+        with self.lock:
+            peer = self.rooms.get(room_name, {}).get('peers', {}).get(peer_id)
+            poses = peer.get('poses', 0) if peer else 0
         self._remove(room_name, peer_id)
+        self.log('leave %s (room "%s", poses=%d)' % (peer_id, room_name, poses))
         msg = json.dumps({'type': 'left', 'id': peer_id}).encode('utf-8')
         with self.lock:
             others = [p['sock'] for p in self.rooms.get(room_name, {}).get('peers', {}).values() if p.get('alive')]
@@ -448,8 +476,38 @@ class Handler(SimpleHTTPRequestHandler):
             remaining -= len(chunk)
 
     def do_GET(self):
-        if urlsplit(self.path).path == '/relay' and self.headers.get('Upgrade', '').lower() == 'websocket' and RELAY is not None:
-            self.handle_relay()
+        path = urlsplit(self.path).path
+        if path == '/relay':
+            upgrade = self.headers.get('Upgrade', '').lower() == 'websocket'
+            # Log every /relay request so "is it even arriving?" is answerable from
+            # the server console alone (this is the line that was missing before).
+            print('[relay] GET /relay from %s (upgrade=%s, connection=%r)' % (
+                self.client_address[0] if self.client_address else '?', upgrade,
+                self.headers.get('Connection', '')), flush=True)
+            if upgrade and RELAY is not None:
+                self.handle_relay()
+                return
+            if RELAY is None:
+                self.send_error(503, 'Relay not initialised')
+                return
+            # A non-WebSocket /relay request (e.g. curl, or a proxy that stripped the
+            # Upgrade header) gets a clear 426 instead of a confusing 404 file-missing.
+            body = json.dumps({'error': '/relay is a WebSocket endpoint; the Upgrade: websocket header is missing.', 'path': path}).encode('utf-8')
+            self.send_response(426)
+            self.send_header('Content-Type', 'application/json')
+            self.send_header('Content-Length', str(len(body)))
+            self.send_header('Cache-Control', 'no-store')
+            self.end_headers()
+            self.wfile.write(body)
+            return
+        if path == '/__mp/' and RELAY is not None:
+            body = json.dumps(RELAY.status()).encode('utf-8')
+            self.send_response(200)
+            self.send_header('Content-Type', 'application/json')
+            self.send_header('Content-Length', str(len(body)))
+            self.send_header('Cache-Control', 'no-store')
+            self.end_headers()
+            self.wfile.write(body)
             return
         super().do_GET()
 
@@ -535,6 +593,7 @@ class Handler(SimpleHTTPRequestHandler):
 if __name__ == '__main__':
     args = argparse.ArgumentParser()
     args.add_argument('--port', type=int, default=8000)
+    args.add_argument('--host', default='127.0.0.1', help='bind address; 0.0.0.0 to reach the port through a reverse proxy or from other devices (default 127.0.0.1)')
     args.add_argument('--root', type=Path, help='existing game directory containing index.html, b/, and data/')
     args.add_argument('--open', action='store_true', help='open browser compatibility and launch page')
     args.add_argument('--mp-open', action='store_true', help='one big open room: no access code required (default)')
@@ -549,17 +608,18 @@ if __name__ == '__main__':
     access_code = options.mp_code or ''
     RELAY = Relay(access_code, capacity=options.mp_capacity)
     try:
-        server = ThreadingHTTPServer(('127.0.0.1', options.port), Handler)
+        server = ThreadingHTTPServer((options.host, options.port), Handler)
     except OSError as error:
-        args.error(f'Cannot start on port {options.port}: {error}. Close the previous game server with Ctrl+C, or choose --port 8001.')
-    address = 'http://localhost:%d/' % server.server_port
-    print('Local mirror: %s (Ctrl+C to stop)' % address, flush=True)
+        args.error(f'Cannot start on {options.host}:{options.port}: {error}. Close the previous game server with Ctrl+C, or choose --port 8001.')
+    bind_host = 'localhost' if options.host in ('127.0.0.1', '::1') else options.host
+    address = 'http://%s:%d/' % (bind_host, server.server_port)
+    print('Local mirror: %s (bound to %s, Ctrl+C to stop)' % (address, options.host), flush=True)
     if access_code:
         print('Multiplayer relay: ws://%s:%d/relay  access code: %s  (same room + code on each PC, up to %d players)' % (
-            'localhost', server.server_port, access_code, options.mp_capacity), flush=True)
+            bind_host, server.server_port, access_code, options.mp_capacity), flush=True)
     else:
         print('Multiplayer relay: ws://%s:%d/relay  OPEN room, no access code (up to %d players)' % (
-            'localhost', server.server_port, options.mp_capacity), flush=True)
+            bind_host, server.server_port, options.mp_capacity), flush=True)
     if options.open:
         webbrowser.open(address + '__support/')
     try:
